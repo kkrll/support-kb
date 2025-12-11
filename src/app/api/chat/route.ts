@@ -1,14 +1,15 @@
 import { systemPrompt, findMatch } from "@/kb";
 import { defaultModel } from "@/lib/openrouter";
+import { supabase } from "@/lib/supabase";
 
 export async function POST(req: Request) {
   try {
-    const { messages, model } = await req.json();
-    
+    const { messages, model, clientId, conversationId } = await req.json();
+
     console.log("=== Chat API Request ===");
     console.log("Model:", model || defaultModel);
     console.log("Messages count:", messages.length);
-    
+
     // Extract text from the last message
     const lastMessage = messages[messages.length - 1];
     const lastMessageText = lastMessage?.content || "";
@@ -16,7 +17,10 @@ export async function POST(req: Request) {
     console.log("User message:", lastMessageText);
 
     const match = findMatch(lastMessageText);
-    console.log("KB match:", match ? `${match.id} (${match.category})` : "none");
+    console.log(
+      "KB match:",
+      match ? `${match.id} (${match.category})` : "none"
+    );
 
     const context = match
       ? `\n\nОтвет из базы знаний:\n${match.answer}${
@@ -25,31 +29,77 @@ export async function POST(req: Request) {
       : "\n\nВ базе знаний нет точного ответа. Постарайся помочь или предложи связаться с поддержкой.";
 
     const selectedModel = model || defaultModel;
-    console.log("Calling OpenRouter with model:", selectedModel);
 
+    let currentConversationId = conversationId;
+    let isNewConversation = false;
+
+    if (!currentConversationId) {
+      const firstUserMessage = messages[messages.length - 1]?.content || "";
+      const title =
+        firstUserMessage.length > 50
+          ? firstUserMessage.substring(0, 50) + "..."
+          : firstUserMessage;
+
+      const { data: newConversation, error } = await supabase
+        .from("conversations")
+        .insert({
+          client_id: clientId,
+          title: title,
+          model: selectedModel,
+        })
+        .select()
+        .single();
+
+      if (error) {
+        console.error("Failed to create conversation:", error);
+        throw new Error("Failed to create conversation");
+      }
+
+      currentConversationId = newConversation.id;
+      isNewConversation = true;
+    }
+
+    const { error: userMessageError } = await supabase.from("messages").insert({
+      conversation_id: currentConversationId,
+      role: "user",
+      content: lastMessage.content,
+      kb_match_id: match?.id,
+    });
+
+    if (userMessageError) {
+      console.error("Failed to insert user message:", userMessageError);
+    }
+
+    console.log("Calling OpenRouter with model:", selectedModel);
     // Call OpenRouter API directly
     const openrouterMessages = [
       { role: "system", content: systemPrompt + context },
       ...messages,
     ];
 
-    console.log("Sending to OpenRouter:", JSON.stringify(openrouterMessages, null, 2));
+    console.log(
+      "Sending to OpenRouter:",
+      JSON.stringify(openrouterMessages, null, 2)
+    );
 
-    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`,
-        "HTTP-Referer": "http://localhost:3000",
-        "X-Title": "Support KB",
-      },
-      body: JSON.stringify({
-        model: selectedModel,
-        messages: openrouterMessages,
-        temperature: 0.7,
-        stream: true,
-      }),
-    });
+    const response = await fetch(
+      "https://openrouter.ai/api/v1/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+          "HTTP-Referer": "http://localhost:3000",
+          "X-Title": "Support KB",
+        },
+        body: JSON.stringify({
+          model: selectedModel,
+          messages: openrouterMessages,
+          temperature: 0.7,
+          stream: true,
+        }),
+      }
+    );
 
     if (!response.ok) {
       const errorData = await response.json();
@@ -58,11 +108,13 @@ export async function POST(req: Request) {
     }
 
     console.log("Streaming response from OpenRouter");
-    
+
     // Parse SSE stream and convert to plain text
     const reader = response.body?.getReader();
     const decoder = new TextDecoder();
     const encoder = new TextEncoder();
+
+    let fullAssistantResponse = "";
 
     const stream = new ReadableStream({
       async start(controller) {
@@ -89,6 +141,7 @@ export async function POST(req: Request) {
                   const content = parsed.choices?.[0]?.delta?.content;
                   if (content) {
                     controller.enqueue(encoder.encode(content));
+                    fullAssistantResponse += content;
                   }
                 } catch (e) {
                   // Ignore parse errors
@@ -99,6 +152,18 @@ export async function POST(req: Request) {
         } catch (error) {
           console.error("Stream error:", error);
         } finally {
+          if (fullAssistantResponse.trim()) {
+            try {
+              await supabase.from("messages").insert({
+                conversation_id: currentConversationId,
+                role: "assistant",
+                content: fullAssistantResponse,
+                kb_match_id: match?.id,
+              });
+            } catch (error) {
+              console.error("Failed to save assistant message:", error);
+            }
+          }
           controller.close();
         }
       },
@@ -108,7 +173,9 @@ export async function POST(req: Request) {
       headers: {
         "Content-Type": "text/plain; charset=utf-8",
         "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
+        Connection: "keep-alive",
+        "X-Conversation-Id": currentConversationId,
+        "X-Is-New-Conversation": isNewConversation.toString(),
       },
     });
   } catch (error: any) {
@@ -116,11 +183,11 @@ export async function POST(req: Request) {
     console.error("Error:", error);
     console.error("Error message:", error?.message);
     console.error("Error stack:", error?.stack);
-    
+
     return new Response(
-      JSON.stringify({ 
+      JSON.stringify({
         error: "Failed to process chat request",
-        details: error?.message || "Unknown error"
+        details: error?.message || "Unknown error",
       }),
       { status: 500, headers: { "Content-Type": "application/json" } }
     );

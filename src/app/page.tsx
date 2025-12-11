@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, FormEvent } from "react";
+import { useState, FormEvent, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card } from "@/components/ui/card";
@@ -25,6 +25,28 @@ export default function Playground() {
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const [clientId, setClientId] = useState("test");
+  const [conversationId, setConversationId] = useState("");
+
+  useEffect(() => {
+    let storedClientId = localStorage.getItem("clientId");
+    if (!storedClientId) {
+      storedClientId =
+        "client_" +
+        Date.now() +
+        "_" +
+        Math.random().toString(36).substring(2, 9);
+      localStorage.setItem("clientId", storedClientId);
+    }
+
+    setClientId(storedClientId);
+
+    const storedConversationId = localStorage.getItem("conversationId");
+    if (storedConversationId) {
+      setConversationId(storedConversationId);
+    }
+  }, []);
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
@@ -54,11 +76,22 @@ export default function Playground() {
             { role: "user", content: userMessage.content },
           ],
           model: selectedModel,
+          clientId: clientId,
+          conversationId: conversationId || undefined,
         }),
       });
 
       if (!response.ok) {
         throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      const newConversationId = response.headers.get("X-Conversation-Id");
+      const isNewConversation =
+        response.headers.get("X-Is-New-Conversation") === "true";
+
+      if (newConversationId) {
+        setConversationId(newConversationId);
+        localStorage.setItem("conversationId", newConversationId);
       }
 
       const reader = response.body?.getReader();
@@ -97,6 +130,14 @@ export default function Playground() {
     }
   }
 
+  function handleNewChat() {
+    setMessages([]);
+    setConversationId("");
+    setInput("");
+    setError(null);
+    localStorage.removeItem("conversationId");
+  }
+
   function handleClearChat() {
     setMessages([]);
     setError(null);
@@ -105,10 +146,17 @@ export default function Playground() {
   return (
     <div className="max-w-2xl mx-auto p-6">
       <div className="flex justify-between items-center mb-6">
-        <h1 className="text-2xl font-semibold">Playground</h1>
+        <div className="flex items-center gap-4">
+          <h1 className="text-2xl font-semibold">Playground</h1>
+          {conversationId && (
+            <span className="text-sm text-muted-foreground">
+              Chat: {conversationId.substring(0, 8)}...
+            </span>
+          )}
+        </div>
         <div className="flex gap-2">
-          <Button variant="outline" onClick={handleClearChat} size="sm">
-            Clear
+          <Button variant="outline" onClick={handleNewChat}>
+            New Chat
           </Button>
           <Select value={selectedModel} onValueChange={setSelectedModel}>
             <SelectTrigger className="w-[220px]">
@@ -125,7 +173,7 @@ export default function Playground() {
         </div>
       </div>
 
-      <Card className="p-4 mb-4 h-[500px] overflow-y-auto space-y-4">
+      <Card className="p-4 mb-4 h-[500px] overflow-y-auto gap-4">
         {messages.length === 0 && (
           <p className="text-muted-foreground text-sm">
             Ask something to test the support bot...
@@ -159,7 +207,10 @@ export default function Playground() {
           placeholder="Где найти пароль от курса?"
           disabled={isLoading}
         />
-        <Button type="submit" disabled={isLoading || !input.trim()}>
+        <Button
+          type="submit"
+          disabled={isLoading || !input.trim() || !clientId}
+        >
           {isLoading ? "Sending..." : "Send"}
         </Button>
       </form>
